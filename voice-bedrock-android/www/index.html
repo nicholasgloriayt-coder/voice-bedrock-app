@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Voice Bedrock Elfu</title>
+<style>
+:root{--bg:#14161a;--card:#1e2128;--tx:#e8eaed;--mut:#8b93a1;--ok:#4ade80;--ac:#5b8cff;--bad:#f87171}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:16px system-ui,sans-serif;padding:max(16px,env(safe-area-inset-top)) 16px 24px}
+main{max-width:460px;margin:0 auto;display:grid;gap:14px}
+h1{font-size:20px;margin:4px 0}.card{background:var(--card);border-radius:14px;padding:16px}
+.mut{color:var(--mut);font-size:14px}.row{display:flex;gap:8px;align-items:center}
+button{background:var(--ac);color:#fff;border:0;border-radius:10px;padding:12px 16px;font-size:15px;cursor:pointer}
+button.alt{background:#2c313b}button.off{background:var(--bad)}
+input[type=text]{width:100%;padding:10px;border-radius:8px;border:1px solid #333a46;background:#14161a;color:var(--tx)}
+.cmd{font:600 22px ui-monospace,Consolas,monospace;background:#0e1013;padding:14px;border-radius:10px;text-align:center;letter-spacing:1px;user-select:all}
+.dot{width:10px;height:10px;border-radius:50%;background:#555;display:inline-block}.dot.on{background:var(--ok)}
+ul{list-style:none;margin:8px 0 0;padding:0}li{padding:6px 0;display:flex;gap:8px;align-items:center}
+li .dot.talk{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.hidden{display:none}input[type=range]{width:100%}
+</style>
+</head>
+<body>
+<main>
+  <h1>🎙️ Voice Bedrock Elfu</h1>
+
+  <section class="card" id="sConnect">
+    <div class="mut" style="margin-bottom:8px">Servidor de voz</div>
+    <input type="text" id="url" autocapitalize="off" spellcheck="false">
+    <div class="row" style="margin-top:12px"><button id="bStart">Conectar</button></div>
+    <p class="mut" id="err"></p>
+  </section>
+
+  <section class="card hidden" id="sLink">
+    <div class="mut" style="margin-bottom:10px"><b>1.</b> Entre no servidor Minecraft e leia o <b>código de 6 números</b> que aparece no chat (só você vê).<br><b>2.</b> Pode minimizar ou sair do jogo e digitar aqui:</div>
+    <input type="text" id="mcname" placeholder="Seu nome no Minecraft" autocapitalize="off" spellcheck="false">
+    <input type="text" id="codeIn" inputmode="numeric" maxlength="6" placeholder="Código de 6 números" autocomplete="off" style="margin-top:8px">
+    <div class="row" style="margin-top:12px">
+      <button id="bClaim">Vincular</button>
+      <button class="alt" id="bSend">Pedir novo código</button>
+    </div>
+    <p class="mut" id="lerr" style="color:#f87171"></p>
+    <p class="mut">O código vale 10 minutos, mesmo se o Minecraft fechar. "Pedir novo código" só funciona com você dentro do jogo; se o código sumiu, entre de novo no servidor que ele aparece outra vez. Depois de vinculado, o app lembra de você.</p>
+  </section>
+
+  <section class="hidden" id="sLive" style="display:none;gap:14px">
+    <div class="card">
+      <div class="row"><span class="dot on" id="dLive"></span><b id="who">—</b></div>
+      <div class="row" style="margin-top:12px">
+        <button id="bMic">🎤 Microfone ligado</button>
+        <button class="alt" id="bDeaf">🔊 Som ligado</button>
+      </div>
+      <div class="mut" style="margin:14px 0 4px">Volume geral</div>
+      <input type="range" id="vol" min="0" max="150" value="100">
+      <div class="mut" style="margin:14px 0 4px">Sensibilidade do microfone</div>
+      <input type="range" id="gate" min="0" max="100" value="20">
+      <div class="row" style="margin-top:12px"><button class="alt" id="bUnlink">Desvincular</button><button class="alt" id="bQuit">Desconectar</button></div>
+    </div>
+    <div class="card"><b>Perto de você</b><ul id="near"></ul><div class="mut" id="nobody">Ninguém falando agora.</div></div>
+  </section>
+</main>
+
+<script src="config.js"></script>
+<script>
+// ---------- ponte com o Android (serviço em primeiro plano) ----------
+const Native = (() => {
+  try { if (window.Capacitor && Capacitor.isNativePlatform && Capacitor.isNativePlatform()) return Capacitor.registerPlugin("ElfuVoice"); } catch (e) {}
+  return null;
+})();
+</script>
+<script>
+const $ = (id) => document.getElementById(id);
+const RATE = 16000, FRAME = 320; // 20 ms de áudio PCM16 mono
+let ws, ctx, master, micStream, micNode, micMuted = false, deaf = false, gateLevel = 0.02;
+let wantConnected = false, retry = 0;
+const names = {}, speakers = new Map(); // id -> {name,gain,pan,next,last}
+const store = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} },
+};
+
+$("url").value = store.get("url") || (window.ELFU_CONFIG && ELFU_CONFIG.serverUrl) || "";
+const show = (id) => { for (const s of ["sConnect", "sLink", "sLive"]) $(s).style.display = s === id ? (s === "sLive" ? "grid" : "block") : "none"; };
+show("sConnect");
+
+// ---------- áudio ----------
+async function initAudio() {
+  if (ctx) { await ctx.resume(); return; }
+  ctx = new AudioContext({ sampleRate: RATE, latencyHint: "interactive" });
+  master = ctx.createGain(); master.connect(ctx.destination);
+  const code = `class P extends AudioWorkletProcessor{constructor(){super();this.b=new Float32Array(${FRAME});this.n=0}
+  process(i){const c=i[0][0];if(!c)return true;for(let k=0;k<c.length;k++){this.b[this.n++]=c[k];
+  if(this.n===${FRAME}){this.port.postMessage(this.b.slice());this.n=0}}return true}}
+  registerProcessor("mic",P)`;
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+  await openMic();
+  micNode.port.onmessage = (e) => {
+    if (micMuted || !ws || ws.readyState !== 1 || !linked) return;
+    const f = e.data; let sum = 0;
+    for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
+    const rms = Math.sqrt(sum / f.length);
+    if (rms < gateLevel) { hang = Math.max(0, hang - 1); if (!hang) return; } else hang = 8; // ~160 ms de "cauda"
+    const pcm = new Int16Array(f.length);
+    for (let i = 0; i < f.length; i++) pcm[i] = Math.max(-1, Math.min(1, f[i])) * 32767;
+    ws.send(pcm.buffer);
+  };
+}
+// (re)abre o microfone e liga no processador de áudio
+async function openMic() {
+  if (micStream) micStream.getTracks().forEach((t) => t.stop());
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+  const src = ctx.createMediaStreamSource(micStream);
+  if (!micNode) { micNode = new AudioWorkletNode(ctx, "mic"); }
+  else { try { micSrc.disconnect(); } catch (e) {} }
+  micSrc = src; src.connect(micNode);
+}
+let micSrc = null;
+// vigia: se o Android derrubar o microfone ou o áudio, tenta recuperar sozinho
+setInterval(async () => {
+  if (!wantConnected || !ctx) return;
+  try {
+    if (ctx.state !== "running") await ctx.resume();
+    const t = micStream && micStream.getAudioTracks()[0];
+    if (!t || t.readyState === "ended") await openMic();
+  } catch (e) {}
+}, 3000);
+let hang = 0, linked = false;
+
+function playFrame(buf) {
+  if (deaf || !ctx) return;
+  const dv = new DataView(buf);
+  if (dv.getUint8(0) !== 1) return;
+  const id = dv.getUint16(1), vol = dv.getUint8(3) / 255, pan = dv.getInt8(4) / 127;
+  const pcm = new Int16Array(buf.slice(5));
+  let s = speakers.get(id);
+  if (!s) {
+    s = { name: names[id] || "Jogador", next: 0, last: 0 };
+    s.gain = ctx.createGain(); s.pan = ctx.createStereoPanner();
+    s.gain.connect(s.pan); s.pan.connect(master);
+    speakers.set(id, s);
+  }
+  s.gain.gain.value = vol; s.pan.pan.value = pan; s.last = performance.now();
+  const ab = ctx.createBuffer(1, pcm.length, RATE), ch = ab.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  const src = ctx.createBufferSource(); src.buffer = ab; src.connect(s.gain);
+  const now = ctx.currentTime;
+  if (s.next < now + 0.02 || s.next > now + 0.4) s.next = now + 0.06; // jitter buffer ~60 ms
+  src.start(s.next); s.next += ab.duration;
+  renderNear();
+}
+
+function renderNear() {
+  const t = performance.now(), ul = $("near"); ul.innerHTML = "";
+  let n = 0;
+  for (const s of speakers.values()) if (t - s.last < 600) {
+    n++; const li = document.createElement("li");
+    li.innerHTML = '<span class="dot talk"></span>'; li.append(s.name); ul.append(li);
+  }
+  $("nobody").style.display = n ? "none" : "block";
+}
+setInterval(renderNear, 400);
+
+// ---------- conexão ----------
+function connect() {
+  const url = $("url").value.trim();
+  if (!/^wss?:\/\//.test(url)) { $("err").textContent = "Endereço inválido (use wss://...)."; return; }
+  store.set("url", url); $("err").textContent = "";
+  ws = new WebSocket(url); ws.binaryType = "arraybuffer";
+  ws.onopen = () => { retry = 0; ws.send(JSON.stringify({ t: "hello", resume: store.get("resume") })); };
+  ws.onmessage = (e) => {
+    if (typeof e.data !== "string") return playFrame(e.data);
+    const m = JSON.parse(e.data);
+    if (m.t === "need_link") { linked = false; stepName(); show("sLink"); }
+    else if (m.t === "sent") { info("Código enviado para " + m.name + ". Olhe o chat do Minecraft e digite os 6 números."); $("codeIn").value = ""; $("codeIn").focus(); }
+    else if (m.t === "error") { $("lerr").style.color = "#f87171"; $("lerr").textContent = m.msg; $("err").textContent = m.msg; }
+    else if (m.t === "linked") { linked = true; store.set("resume", m.resume); $("who").textContent = "Conectado como " + m.name; show("sLive"); }
+    else if (m.t === "unlinked") { linked = false; store.set("resume", null); stepName(); show("sLink"); }
+    else if (m.t === "who") { names[m.id] = m.name; const s = speakers.get(m.id); if (s) s.name = m.name; }
+  };
+  ws.onclose = () => {
+    linked = false;
+    if (!wantConnected) return;
+    $("err").textContent = "Conexão perdida. Reconectando…";
+    setTimeout(connect, Math.min(10000, 1000 * ++retry));
+  };
+  ws.onerror = () => {};
+}
+$("bStart").onclick = async () => {
+  try { await initAudio(); } catch (e) { $("err").textContent = "Permita o acesso ao microfone para continuar."; return; }
+  if (Native) { try { await Native.start(); } catch (e) {} }
+  wantConnected = true; connect();
+};
+$("bQuit").onclick = async () => {
+  wantConnected = false; linked = false;
+  try { ws && ws.close(); } catch (e) {}
+  if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+  try { micSrc && micSrc.disconnect(); } catch (e) {}
+  micSrc = null; micNode = null;
+  try { ctx && await ctx.close(); } catch (e) {}
+  ctx = null; speakers.clear();
+  if (Native) { try { await Native.stop(); } catch (e) {} }
+  $("err").textContent = ""; show("sConnect");
+};
+function stepName() { $("lerr").textContent = ""; }
+function info(t) { $("lerr").style.color = "#4ade80"; $("lerr").textContent = t; }
+// ao voltar para o app (ex.: depois de o Minecraft fechar), reconecta na hora se a conexão caiu
+document.addEventListener("visibilitychange", () => { if (!document.hidden && wantConnected) { if (ctx && ctx.state !== "running") ctx.resume(); if (!ws || ws.readyState > 1) connect(); } });
+$("mcname").value = store.get("mcname") || "";
+$("bSend").onclick = () => { const n = $("mcname").value.trim(); if (!n) { $("lerr").style.color = "#f87171"; $("lerr").textContent = "Digite seu nome do Minecraft."; return; } store.set("mcname", n); $("lerr").textContent = ""; ws && ws.send(JSON.stringify({ t: "start", name: n })); };
+$("bClaim").onclick = () => {
+  const n = $("mcname").value.trim(), c = $("codeIn").value.trim();
+  if (!n) { $("lerr").style.color = "#f87171"; $("lerr").textContent = "Digite seu nome do Minecraft."; return; }
+  if (!/^\d{6}$/.test(c)) { $("lerr").style.color = "#f87171"; $("lerr").textContent = "O código tem 6 números."; return; }
+  store.set("mcname", n); $("lerr").textContent = "";
+  ws && ws.send(JSON.stringify({ t: "claim", name: n, code: c }));
+};
+$("bUnlink").onclick = () => { store.set("resume", null); ws && ws.send(JSON.stringify({ t: "unlink" })); };
+$("bMic").onclick = () => { micMuted = !micMuted; $("bMic").textContent = micMuted ? "🎤 Microfone mudo" : "🎤 Microfone ligado"; $("bMic").className = micMuted ? "off" : ""; };
+$("bDeaf").onclick = () => { deaf = !deaf; $("bDeaf").textContent = deaf ? "🔇 Som desligado" : "🔊 Som ligado"; $("bDeaf").className = deaf ? "off" : "alt"; ws && ws.send(JSON.stringify({ t: "deaf", v: deaf })); };
+$("vol").oninput = (e) => { if (master) master.gain.value = e.target.value / 100; };
+$("gate").oninput = (e) => { gateLevel = (e.target.value / 100) * 0.1; };
+gateLevel = 0.02;
+</script>
+</body>
+</html>
